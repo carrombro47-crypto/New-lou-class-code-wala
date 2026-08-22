@@ -269,7 +269,7 @@ footer { text-align:center; color:var(--muted); font-size:11.5px; padding:14px; 
     // unmute kar dega.
     function attemptAutoplay() {
         video.play().catch(function () {
-            video.muted = false;
+            video.muted = true;
             video.play().catch(function () {});
         });
     }

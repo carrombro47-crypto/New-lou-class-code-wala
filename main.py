@@ -1,6 +1,8 @@
 import base64
 import os
+import random
 import re
+import string
 import threading
 import time
 import unicodedata
@@ -45,6 +47,78 @@ flask_app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
 
 db = get_db()
 lectures_col = db["lectures"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LIVE UNIQUE-CODE STORE (backend memory — NOT MongoDB)
+#  Purpose: pehle har playlist/segment request pe MongoDB se original_url
+#  lookup hota tha (name ke through) — live m3u8 har 2-6 sec me refresh hota
+#  hai, isliye ye baar-baar ka DB read hi buffering/atakne ka asli reason
+#  tha. Ab generate ke time hi ek unique code बनता hai jiske against
+#  original_url is process ki memory me rakha jaata hai — streaming ke
+#  waqt sirf yahi dict check hota hai (O(1), zero DB load). MongoDB me bhi
+#  save hota hai (sirf ek baar, generate ke waqt) taaki restart/redeploy ke
+#  baad bhi record/backup maujood rahe — lekin streaming path isse kabhi
+#  nahi padhta.
+# ═══════════════════════════════════════════════════════════════════════════
+LIVE_CODE_TTL = timedelta(hours=5)
+LIVE_CODES = {}  # code -> {"name": str, "title": str, "expires_at": datetime}
+LIVE_CODES_LOCK = threading.Lock()
+
+# Fixed routes jinse code kabhi match na ho (case-sensitive hai isliye
+# asal me clash nahi hota — ye sirf extra safety hai).
+_RESERVED_CODES = {"API", "LOGIN", "LOGOUT", "HEALTH", "GENERATED", "RECORDINGS", "STATIC", "FAVICON.ICO"}
+
+
+def _prune_expired_codes():
+    now = datetime.utcnow()
+    dead = [c for c, e in LIVE_CODES.items() if e["expires_at"] <= now]
+    for c in dead:
+        LIVE_CODES.pop(c, None)
+
+
+def generate_unique_code(title_seed: str) -> str:
+    """Title ke sirf English letters+numbers se ek prefix, + random
+    letters/numbers suffix — final code hamesha unique hota hai."""
+    seed = re.sub(r"[^A-Za-z0-9]", "", title_seed or "").upper()
+    prefix = seed[:4]
+    alphabet = string.ascii_uppercase + string.digits
+    with LIVE_CODES_LOCK:
+        _prune_expired_codes()
+        while True:
+            suffix_len = 6 if prefix else 8
+            suffix = "".join(random.choices(alphabet, k=suffix_len))
+            code = (prefix + suffix)[:12]
+            if code not in LIVE_CODES and code not in _RESERVED_CODES:
+                return code
+
+
+def _save_live_code(code: str, name: str, title: str, expires_at: datetime):
+    with LIVE_CODES_LOCK:
+        LIVE_CODES[code] = {"name": name, "title": title, "expires_at": expires_at}
+
+
+def _get_live_code(code: str):
+    """Pehle memory check karo (hot path, zero DB load). Miss ho (jaise
+    server restart ke turant baad) to hi ek baar MongoDB se refill karo."""
+    with LIVE_CODES_LOCK:
+        entry = LIVE_CODES.get(code)
+        if entry:
+            if entry["expires_at"] <= datetime.utcnow():
+                LIVE_CODES.pop(code, None)
+                return None
+            return entry
+
+    doc = lectures_col.find_one({"live_code": code}, {"_id": 1, "title": 1, "live_code_expires_at": 1})
+    if not doc:
+        return None
+    expires_at = doc.get("live_code_expires_at")
+    if not expires_at or expires_at <= datetime.utcnow():
+        return None
+    entry = {"name": doc["_id"], "title": doc.get("title") or display_title(doc["_id"]), "expires_at": expires_at}
+    with LIVE_CODES_LOCK:
+        LIVE_CODES[code] = entry
+    return entry
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -113,14 +187,15 @@ def _inherit_auth_params(seg_url: str, playlist_url: str) -> str:
         return seg_url
 
 
-def _rewrite_m3u8(body: str, playlist_url: str, name: str) -> str:
-    """Playlist ke saare URLs ko proxy tokens se replace karo."""
-    base = request.host_url.rstrip("/")
+def _rewrite_m3u8(body: str, playlist_url: str, seg_base: str) -> str:
+    """Playlist ke saare URLs ko proxy tokens se replace karo.
+    seg_base: poora base URL jahan tokenized segments serve honge
+    (e.g. https://host/api/live/<name>/seg ya https://host/api/livecode/<code>/seg)."""
 
     def tok(raw: str) -> str:
         absolute = urljoin(playlist_url, raw.strip())
         absolute = _inherit_auth_params(absolute, playlist_url)
-        return f"{base}/api/live/{quote(name)}/seg?u={_b64e(absolute)}"
+        return f"{seg_base}?u={_b64e(absolute)}"
 
     out_lines = []
     for line in body.splitlines():
@@ -189,7 +264,8 @@ def live_playlist(name):
     if not r.ok:
         return jsonify({"error": f"Upstream failed: {r.status_code}"}), r.status_code
 
-    body = _rewrite_m3u8(r.text, doc["original_url"], name)
+    seg_base = f"{request.host_url.rstrip('/')}/api/live/{quote(name)}/seg"
+    body = _rewrite_m3u8(r.text, doc["original_url"], seg_base)
     return Response(
         body,
         200,
@@ -222,9 +298,90 @@ def live_segment(name):
     ctype = (r.headers.get("Content-Type") or "").lower()
     if "mpegurl" in ctype or "m3u8" in ctype or parsed.path.lower().endswith(".m3u8"):
         # nested playlist — usko bhi rewrite karo
-        doc = lectures_col.find_one({"_id": name}, {"original_url": 1})
-        playlist_base = doc["original_url"] if doc else url
-        body = _rewrite_m3u8(r.text, url, name)
+        # (pehle yahan ek MongoDB query thi jiska result kabhi use hi nahi
+        # hota tha — pure wasted DB read har nested-playlist segment pe.
+        # Hata diya, behavior bilkul same hai.)
+        seg_base = f"{request.host_url.rstrip('/')}/api/live/{quote(name)}/seg"
+        body = _rewrite_m3u8(r.text, url, seg_base)
+        return Response(body, 200, content_type="application/vnd.apple.mpegurl")
+
+    headers = {
+        "Cache-Control": "public, max-age=30",
+        "Accept-Ranges": "bytes",
+    }
+    if r.headers.get("Content-Range"):
+        headers["Content-Range"] = r.headers["Content-Range"]
+    return Response(
+        r.content,
+        206 if r.status_code == 206 else 200,
+        content_type=r.headers.get("Content-Type") or "video/mp2t",
+        headers=headers,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  HLS PROXY — unique-code variant (zero MongoDB reads during streaming)
+#  original_url yahan seedha public link se aati hai (jaisa /<code>/<url>
+#  route ne resolve kiya) — sirf "code" valid+not-expired hai ya nahi, wo
+#  LIVE_CODES (in-memory) se check hota hai. Playlist/segment fetch logic
+#  purane /api/live/ routes jaisi hi hai.
+# ═══════════════════════════════════════════════════════════════════════════
+
+@flask_app.route("/api/livecode/<code>/playlist")
+def live_playlist_code(code):
+    entry = _get_live_code(code)
+    if not entry:
+        return jsonify({"error": "Link expire ho gaya ya invalid hai"}), 404
+
+    original_url = request.args.get("u", "")
+    if not original_url.startswith(("http://", "https://")):
+        return jsonify({"error": "Invalid stream URL"}), 400
+
+    try:
+        r = _fetch_upstream(original_url)
+    except requests.RequestException as e:
+        return jsonify({"error": f"Upstream error: {e}"}), 502
+    if not r.ok:
+        return jsonify({"error": f"Upstream failed: {r.status_code}"}), r.status_code
+
+    seg_base = f"{request.host_url.rstrip('/')}/api/livecode/{quote(code)}/seg"
+    body = _rewrite_m3u8(r.text, original_url, seg_base)
+    return Response(
+        body,
+        200,
+        content_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
+@flask_app.route("/api/livecode/<code>/seg")
+def live_segment_code(code):
+    entry = _get_live_code(code)
+    if not entry:
+        return jsonify({"error": "Link expire ho gaya ya invalid hai"}), 404
+
+    token = request.args.get("u")
+    if not token:
+        return jsonify({"error": "Missing segment token"}), 400
+    try:
+        url = _b64d(token)
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError("bad scheme")
+    except Exception:
+        return jsonify({"error": "Invalid segment token"}), 400
+
+    try:
+        r = _fetch_upstream(url)
+    except requests.RequestException as e:
+        return jsonify({"error": f"Upstream error: {e}"}), 502
+    if not r.ok:
+        return jsonify({"error": f"Upstream failed: {r.status_code}"}), r.status_code
+
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "mpegurl" in ctype or "m3u8" in ctype or parsed.path.lower().endswith(".m3u8"):
+        seg_base = f"{request.host_url.rstrip('/')}/api/livecode/{quote(code)}/seg"
+        body = _rewrite_m3u8(r.text, url, seg_base)
         return Response(body, 200, content_type="application/vnd.apple.mpegurl")
 
     headers = {
@@ -316,17 +473,35 @@ def api_generate():
             "error": "Invalid class name — sirf letters, numbers aur hyphen(-) allowed hai.",
         }), 400
 
+    source_type = (data.get("source_type") or "live").strip().lower()
+    title = display_title(name)
+
     now = datetime.utcnow()
     token = base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
+
+    # Live mode: ek unique code generate karo (title ke keywords + random),
+    # jo streaming ke waqt MongoDB ki jagah backend memory (LIVE_CODES) se
+    # validate hoga — 5 ghante ke liye valid.
+    live_code = None
+    live_code_expires_at = None
+    if source_type == "live":
+        live_code = generate_unique_code(name)
+        live_code_expires_at = now + LIVE_CODE_TTL
+
+    set_fields = {
+        "original_url": original_url,
+        "status": "LIVE",
+        "title": title,
+        "updated_at": now,
+    }
+    if live_code:
+        set_fields["live_code"] = live_code
+        set_fields["live_code_expires_at"] = live_code_expires_at
+
     lectures_col.update_one(
         {"_id": name},
         {
-            "$set": {
-                "original_url": original_url,
-                "status": "LIVE",
-                "title": display_title(name),
-                "updated_at": now,
-            },
+            "$set": set_fields,
             "$setOnInsert": {
                 "created_at": now,
                 "token": token,
@@ -345,12 +520,19 @@ def api_generate():
     )
     doc = lectures_col.find_one({"_id": name})
 
+    if live_code:
+        _save_live_code(live_code, name, title, live_code_expires_at)
+
     # Live end hote hi automatic download + local-storage processing ke
     # liye background watcher — koi manual "Start Recording" click zaroori
     # nahi, generate hote hi khud shuru ho jaata hai.
     start_recording(name, original_url, lectures_col)
 
-    public_link = f"{PUBLIC_BASE_URL}/{name}"
+    if live_code:
+        public_link = f"{PUBLIC_BASE_URL}/{live_code}/{original_url}"
+    else:
+        public_link = f"{PUBLIC_BASE_URL}/{name}"
+
     return jsonify({
         "ok": True,
         "name": name,
@@ -444,10 +626,15 @@ def api_download(name):
 
 @flask_app.route("/generated/<name>")
 def generated(name):
-    doc = lectures_col.find_one({"_id": name}, {"_id": 1, "status": 1})
+    doc = lectures_col.find_one(
+        {"_id": name}, {"_id": 1, "status": 1, "live_code": 1, "original_url": 1}
+    )
     if not doc:
         return redirect(url_for("index"))
-    public_link = f"{PUBLIC_BASE_URL}/{name}"
+    if doc.get("live_code"):
+        public_link = f"{PUBLIC_BASE_URL}/{doc['live_code']}/{doc['original_url']}"
+    else:
+        public_link = f"{PUBLIC_BASE_URL}/{name}"
     return render_template(
         "generated.html", name=name, public_link=public_link, status=doc.get("status")
     )
@@ -468,6 +655,33 @@ def play(name):
         name=name,
         title=display_title(name),
         status=doc.get("status", "LIVE"),
+    )
+
+
+@flask_app.route("/<code>/<path:original_url>")
+def play_live_code(code, original_url):
+    """Naya unique-code wala public link:
+    PUBLIC_BASE_URL/<code>/<original m3u8 URL, http(s) samet, as-is>
+    Validation sirf LIVE_CODES (backend memory) se — MongoDB ko is
+    streaming path pe kabhi touch nahi kiya jaata (miss hone par hi ek
+    baar fallback refill hota hai, _get_live_code ke andar)."""
+    entry = _get_live_code(code)
+    if not entry:
+        return "Link expire ho gaya ya invalid hai. 😔", 404
+
+    full_url = original_url
+    if request.query_string:
+        full_url += "?" + request.query_string.decode()
+    if not full_url.startswith(("http://", "https://")):
+        return "Link expire ho gaya ya invalid hai. 😔", 404
+
+    return render_template(
+        "player.html",
+        name=entry["name"],
+        title=entry.get("title") or display_title(entry["name"]),
+        status="LIVE",
+        live_code=code,
+        live_original_url=full_url,
     )
 
 

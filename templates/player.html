@@ -183,6 +183,8 @@ footer { text-align:center; color:var(--muted); font-size:11.5px; padding:14px; 
 
     var NAME = {{ name|tojson }};
     var INITIAL_STATUS = {{ status|tojson }};
+    var LIVE_CODE = {{ (live_code or "")|tojson }};
+    var LIVE_ORIGINAL_URL = {{ (live_original_url or "")|tojson }};
 
     var video = document.getElementById("video");
     var shell = document.getElementById("shell");
@@ -338,7 +340,9 @@ footer { text-align:center; color:var(--muted); font-size:11.5px; padding:14px; 
     }
 
     // ─────────── Live player ───────────
-    var PLAYLIST_URL = "/api/live/" + encodeURIComponent(NAME) + "/playlist";
+    var PLAYLIST_URL = LIVE_CODE
+        ? "/api/livecode/" + encodeURIComponent(LIVE_CODE) + "/playlist?u=" + encodeURIComponent(LIVE_ORIGINAL_URL)
+        : "/api/live/" + encodeURIComponent(NAME) + "/playlist";
 
     function startLive() {
         showLoading("Live class load ho rahi hai…");
